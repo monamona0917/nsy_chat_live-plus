@@ -1,0 +1,370 @@
+package service
+
+import (
+	"path/filepath"
+	"replive/config"
+	"replive/dal"
+	"replive/model"
+	"replive/rep_api"
+	"strings"
+	"time"
+
+	"github.com/cloudwego/hertz/pkg/common/hlog"
+	"gorm.io/gorm"
+)
+
+const profileMediaMaxPages = 50
+
+func syncChatRoomProfileMedia(room *model.ChatRoom, now time.Time) {
+	if room == nil || room.UserProfile == nil {
+		return
+	}
+	profile := room.UserProfile
+	owner := firstNonEmpty(profile.GetDisplayName(), profile.GetUniqueId(), profile.GetUserId(), room.GetUserId())
+	urls := map[string]string{
+		"chat_room_avatar": profile.GetAvatarUrl(),
+	}
+	downloadProfileURLSet(owner, urls, now)
+}
+
+func syncOshiProfiles() error {
+	now := time.Now()
+	syncedCount := 0
+	pageToken := ""
+
+	for page := 0; page < profileMediaMaxPages; page++ {
+		resp, err := rep_api.ListMyOshis(200, pageToken)
+		if err != nil {
+			return err
+		}
+		items := resp.GetOshis()
+		hlog.Infof(
+			"sync oshi profiles page: %d, page_count: %d, my_oshis_count: %d, next_token: %t",
+			page+1,
+			len(items),
+			resp.GetMyOshisCount(),
+			strings.TrimSpace(resp.GetNextPageToken()) != "",
+		)
+		if err := saveOshis(items, now); err != nil {
+			return err
+		}
+		for _, item := range items {
+			downloadProfileURLSet(oshiOwner(item), oshiMediaURLs(item), now)
+		}
+		syncedCount += len(items)
+
+		nextToken := strings.TrimSpace(resp.GetNextPageToken())
+		if nextToken == "" || nextToken == pageToken {
+			break
+		}
+		pageToken = nextToken
+	}
+
+	followingCount, err := syncFollowings(now)
+	if err != nil {
+		return err
+	}
+
+	hlog.Infof("sync oshi profiles done, oshi_count: %d, following_count: %d", syncedCount, followingCount)
+	return nil
+}
+
+func syncFollowings(now time.Time) (int, error) {
+	syncedCount := 0
+	pageToken := ""
+
+	for page := 0; page < profileMediaMaxPages; page++ {
+		resp, err := rep_api.ListFollowings(20, pageToken)
+		if err != nil {
+			return syncedCount, err
+		}
+		items := resp.GetFollowTargets()
+		hlog.Infof(
+			"sync followings page: %d, page_count: %d, next_token: %t",
+			page+1,
+			len(items),
+			strings.TrimSpace(resp.GetNextPageToken()) != "",
+		)
+		if err := saveFollowings(items, now); err != nil {
+			return syncedCount, err
+		}
+		for _, item := range items {
+			downloadProfileURLSet(followTargetOwner(item), followTargetMediaURLs(item), now)
+		}
+		syncedCount += len(items)
+
+		nextToken := strings.TrimSpace(resp.GetNextPageToken())
+		if nextToken == "" || nextToken == pageToken {
+			break
+		}
+		pageToken = nextToken
+	}
+
+	return syncedCount, nil
+}
+
+func saveOshis(items []*model.ListMyOshisOshi, now time.Time) error {
+	return dal.WithWriteDB(func(db *gorm.DB) error {
+		for _, item := range items {
+			dbOshi := buildDBOshi(item, now)
+			if dbOshi == nil || strings.TrimSpace(dbOshi.OshiId) == "" {
+				continue
+			}
+			var existing dal.Oshi
+			if err := db.Table(dal.Oshi{}.TableName()).
+				Where("oshi_id = ?", dbOshi.OshiId).
+				Limit(1).
+				Find(&existing).Error; err != nil {
+				return err
+			}
+			if existing.Id > 0 {
+				dbOshi.Id = existing.Id
+				if err := db.Save(dbOshi).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			if err := db.Create(dbOshi).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func saveFollowings(items []*model.FollowTarget, now time.Time) error {
+	return dal.WithWriteDB(func(db *gorm.DB) error {
+		for _, item := range items {
+			dbFollowing := buildDBFollowing(item, now)
+			if dbFollowing == nil || strings.TrimSpace(dbFollowing.TargetKey) == "" {
+				continue
+			}
+			var existing dal.Following
+			if err := db.Table(dal.Following{}.TableName()).
+				Where("target_key = ?", dbFollowing.TargetKey).
+				Limit(1).
+				Find(&existing).Error; err != nil {
+				return err
+			}
+			if existing.Id > 0 {
+				dbFollowing.Id = existing.Id
+				if err := db.Save(dbFollowing).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			if err := db.Create(dbFollowing).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func saveUserPrivate(user *model.UserPrivate, now time.Time) error {
+	dbUser := buildDBUserPrivate(user, now)
+	if dbUser == nil || strings.TrimSpace(dbUser.UserId) == "" {
+		return nil
+	}
+	return dal.WithWriteDB(func(db *gorm.DB) error {
+		var existing dal.UserPrivate
+		if err := db.Table(dal.UserPrivate{}.TableName()).
+			Where("user_id = ?", dbUser.UserId).
+			Limit(1).
+			Find(&existing).Error; err != nil {
+			return err
+		}
+		if existing.Id > 0 {
+			dbUser.Id = existing.Id
+			return db.Save(dbUser).Error
+		}
+		return db.Create(dbUser).Error
+	})
+}
+
+func buildDBOshi(item *model.ListMyOshisOshi, now time.Time) *dal.Oshi {
+	if item == nil {
+		return nil
+	}
+	user := item.GetUser()
+	dbOshi := &dal.Oshi{
+		OshiId:                    item.GetOshiId(),
+		Name:                      item.GetName(),
+		ProfileImageUrl:           item.GetProfileImageUrl(),
+		MembershipImageUrl:        item.GetMembershipImageUrl(),
+		UserId:                    user.GetUserId(),
+		UniqueId:                  user.GetUniqueId(),
+		DisplayName:               user.GetDisplayName(),
+		UserProfileImageUrl:       user.GetProfileImageUrl(),
+		ProfileBackgroundImageUrl: user.GetProfileBackgroundImageUrl(),
+		SmProfileImageUrl:         user.GetSmProfileImageUrl(),
+		UserOshiId:                item.GetOshiId(),
+		SyncedAt:                  now.Unix(),
+	}
+	if dbOshi.UserOshiId == "" {
+		dbOshi.UserOshiId = dbOshi.OshiId
+	}
+	return dbOshi
+}
+
+func buildDBFollowing(item *model.FollowTarget, now time.Time) *dal.Following {
+	if item == nil {
+		return nil
+	}
+	user := item.GetUser()
+	oshi := item.GetOshi()
+	dbFollowing := &dal.Following{
+		TargetType: int64(item.GetType()),
+		SyncedAt:   now.Unix(),
+	}
+	if user != nil {
+		dbFollowing.UserId = user.GetUserId()
+		dbFollowing.UniqueId = user.GetUniqueId()
+		dbFollowing.DisplayName = user.GetDisplayName()
+		dbFollowing.ProfileImageUrl = user.GetProfileImageUrl()
+		dbFollowing.SmProfileImageUrl = user.GetSmProfileImageUrl()
+		dbFollowing.ProfileBackgroundImageUrl = user.GetProfileBackgroundImageUrl()
+		if dbFollowing.UserId != "" {
+			dbFollowing.TargetKey = "user:" + dbFollowing.UserId
+		}
+	}
+	if oshi != nil {
+		dbFollowing.OshiId = oshi.GetOshiId()
+		dbFollowing.OshiName = oshi.GetName()
+		dbFollowing.OshiProfileImageUrl = oshi.GetProfileImageUrl()
+		dbFollowing.OshiMembershipImageUrl = oshi.GetMembershipImageUrl()
+		if dbFollowing.DisplayName == "" {
+			dbFollowing.DisplayName = oshi.GetName()
+		}
+		if dbFollowing.TargetKey == "" && dbFollowing.OshiId != "" {
+			dbFollowing.TargetKey = "oshi:" + dbFollowing.OshiId
+		}
+	}
+	if dbFollowing.TargetKey == "" && dbFollowing.UniqueId != "" {
+		dbFollowing.TargetKey = "user_unique:" + dbFollowing.UniqueId
+	}
+	return dbFollowing
+}
+
+func buildDBUserPrivate(user *model.UserPrivate, now time.Time) *dal.UserPrivate {
+	if user == nil {
+		return nil
+	}
+	return &dal.UserPrivate{
+		UserId:                    user.GetUserId(),
+		UniqueId:                  user.GetUniqueId(),
+		DisplayName:               user.GetDisplayName(),
+		ProfileImageUrl:           user.GetProfileImageUrl(),
+		SmProfileImageUrl:         user.GetSmProfileImageUrl(),
+		ProfileBackgroundImageUrl: user.GetProfileBackgroundImageUrl(),
+		SyncedAt:                  now.Unix(),
+	}
+}
+
+func oshiOwner(item *model.ListMyOshisOshi) string {
+	if item == nil {
+		return "unknown"
+	}
+	user := item.GetUser()
+	return firstNonEmpty(user.GetDisplayName(), item.GetName(), user.GetUniqueId(), item.GetOshiId(), user.GetUserId(), "unknown")
+}
+
+func userPrivateOwner(user *model.UserPrivate) string {
+	if user == nil {
+		return "unknown"
+	}
+	return firstNonEmpty(user.GetDisplayName(), user.GetUniqueId(), user.GetUserId(), "unknown")
+}
+
+func followTargetOwner(item *model.FollowTarget) string {
+	if item == nil {
+		return "unknown"
+	}
+	user := item.GetUser()
+	oshi := item.GetOshi()
+	return firstNonEmpty(user.GetDisplayName(), oshi.GetName(), user.GetUniqueId(), user.GetUserId(), oshi.GetOshiId(), "unknown")
+}
+
+func oshiMediaURLs(item *model.ListMyOshisOshi) map[string]string {
+	urls := make(map[string]string)
+	if item == nil {
+		return urls
+	}
+	user := item.GetUser()
+	urls["oshi_profile"] = item.GetProfileImageUrl()
+	urls["membership"] = item.GetMembershipImageUrl()
+	urls["profile"] = user.GetProfileImageUrl()
+	urls["sm_profile"] = user.GetSmProfileImageUrl()
+	urls["profile_background"] = user.GetProfileBackgroundImageUrl()
+	return urls
+}
+
+func followTargetMediaURLs(item *model.FollowTarget) map[string]string {
+	urls := make(map[string]string)
+	if item == nil {
+		return urls
+	}
+	user := item.GetUser()
+	if user != nil {
+		urls["following_profile"] = user.GetProfileImageUrl()
+		urls["following_sm_profile"] = user.GetSmProfileImageUrl()
+		urls["following_profile_background"] = user.GetProfileBackgroundImageUrl()
+	}
+	oshi := item.GetOshi()
+	if oshi != nil {
+		user := oshi.GetUser()
+		urls["following_oshi_profile"] = oshi.GetProfileImageUrl()
+		urls["following_oshi_membership"] = oshi.GetMembershipImageUrl()
+		urls["following_oshi_user_profile"] = user.GetProfileImageUrl()
+		urls["following_oshi_user_sm_profile"] = user.GetSmProfileImageUrl()
+		urls["following_oshi_user_profile_background"] = user.GetProfileBackgroundImageUrl()
+	}
+	return urls
+}
+
+func userPrivateMediaURLs(user *model.UserPrivate) map[string]string {
+	urls := make(map[string]string)
+	if user == nil {
+		return urls
+	}
+	urls["user_private_profile"] = user.GetProfileImageUrl()
+	urls["user_private_sm_profile"] = user.GetSmProfileImageUrl()
+	urls["user_private_profile_background"] = user.GetProfileBackgroundImageUrl()
+	return urls
+}
+
+func downloadProfileURLSet(owner string, urls map[string]string, now time.Time) {
+	owner = firstNonEmpty(owner, "unknown")
+	prefix := filepath.Join(config.GetMediaPath(), "profile")
+	seen := make(map[string]struct{}, len(urls))
+	for kind, rawURL := range urls {
+		rawURL = strings.TrimSpace(rawURL)
+		if rawURL == "" {
+			continue
+		}
+		if _, ok := seen[rawURL]; ok {
+			continue
+		}
+		seen[rawURL] = struct{}{}
+		if _, err := DownloadProfileMedia(rawURL, now, prefix, owner, kind); err != nil {
+			hlog.Warnf("download profile media failed, owner=%s kind=%s err=%v", owner, kind, err)
+		}
+	}
+}
+
+func timestampSeconds(ts *model.Timestamp) int64 {
+	if ts == nil {
+		return 0
+	}
+	return ts.GetSeconds()
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
